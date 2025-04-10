@@ -1,564 +1,646 @@
 import sys
 import os
+import glob
 import datetime
-import re
-import shutil
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                            QLabel, QLineEdit, QPushButton, QComboBox, QTextBrowser,
-                            QSplitter, QFileDialog, QListWidget, QMessageBox, QProgressBar,
-                            QToolButton, QFrame, QSizePolicy)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt5.QtGui import QFont, QTextOption, QIcon
+import markdown
+import logging
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+                            QLabel, QLineEdit, QComboBox, QPushButton, QTextEdit, 
+                            QSplitter, QListWidget, QMessageBox, QStatusBar,
+                            QFrame, QProgressBar, QTabWidget)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtGui import QDesktopServices
 
-# Import the YouTube processing functionality from main.py
-from main import FFmpegHandler, AudioDownloader, Transcriber, Summarizer, CONFIG, logger
-# Import custom styles
-from styles import MAIN_STYLE, HTML_STYLE, SUMMARY_CSS
+# Import the YouTube processing functionality
+from main import CONFIG, AudioDownloader, Transcriber, Summarizer, FileManager, FFmpegHandler
 
-# Add markdown to HTML converter
-try:
-    import markdown
-    HAS_MARKDOWN = True
-except ImportError:
-    HAS_MARKDOWN = False
-    print("Markdown module not found. Install with: pip install markdown")
-    print("Using plain text display instead.")
+# Import styles
+from styles import STYLES
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Constants
-OUTPUT_FOLDER = "output"  # The folder to store all summaries
-TEMP_FOLDER = "temp_files"  # Temporary files during processing
+OUTPUT_FOLDER = "output"
+APP_TITLE = "YouTube Video Summarizer"
 
-class ProcessingThread(QThread):
-    """Thread for handling the YouTube video processing in the background."""
-    update_progress = pyqtSignal(int, str)
-    finished_signal = pyqtSignal(bool, str, str)  # Success, message, filename
 
-    def __init__(self, youtube_url, language_code):
+class WorkerThread(QThread):
+    """Worker thread to handle processing without freezing the UI"""
+    update_progress_signal = pyqtSignal(int, str)
+    complete_signal = pyqtSignal(bool, str)
+    log_signal = pyqtSignal(str, str)  # message, level (info, success, warning, error)
+    
+    def __init__(self, youtube_url, source_language, output_language):
         super().__init__()
         self.youtube_url = youtube_url
-        self.language_code = language_code
-        self.config = CONFIG.copy()
-        self.config["temp_directory"] = TEMP_FOLDER
-
+        self.source_language = source_language
+        self.output_language = output_language
+        self.summary_file_path = ""
+        
+    def log_info(self, message):
+        self.log_signal.emit(message, "info")
+        
+    def log_success(self, message):
+        self.log_signal.emit(message, "success")
+        
+    def log_warning(self, message):
+        self.log_signal.emit(message, "warning")
+        
+    def log_error(self, message):
+        self.log_signal.emit(message, "error")
+        
     def run(self):
         try:
-            # Set up FFmpeg
-            self.update_progress.emit(5, "Setting up FFmpeg...")
-            if not FFmpegHandler.setup():
-                self.finished_signal.emit(False, "FFmpeg setup failed. Please install FFmpeg.", "")
-                return
-
+            # Update UI
+            self.update_progress_signal.emit(10, "Initializing...")
+            self.log_info("Starting to process YouTube video")
+            
+            # Get language names for logging
+            source_language_name = next((lang["name"] for lang in CONFIG["languages"] 
+                                     if lang["code"] == self.source_language), self.source_language)
+            output_language_name = next((lang["name"] for lang in CONFIG["languages"] 
+                                     if lang["code"] == self.output_language), self.output_language)
+            self.log_info(f"Video language: {source_language_name}")
+            self.log_info(f"Summary language: {output_language_name}")
+            
             # Generate timestamp for filenames
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             
             # Set output filenames
-            os.makedirs(self.config["temp_directory"], exist_ok=True)
-            audio_file = os.path.join(self.config["temp_directory"], "downloaded_audio.wav")
+            audio_file = os.path.join(CONFIG["temp_directory"], "downloaded_audio.wav")
+            self.summary_file_path = os.path.join(OUTPUT_FOLDER, f"{timestamp}_summary.md")
             
-            # Create output folder for storing summaries if it doesn't exist
+            # Create temp directory if it doesn't exist
+            os.makedirs(CONFIG["temp_directory"], exist_ok=True)
+            
+            # Create output directory if it doesn't exist
             os.makedirs(OUTPUT_FOLDER, exist_ok=True)
             
-            # Set the output filename 
-            summary_file = os.path.join(OUTPUT_FOLDER, f"{timestamp}_summary.md")
-            
             # Step 1: Download audio
-            self.update_progress.emit(10, "Downloading YouTube audio...")
+            self.update_progress_signal.emit(20, "Downloading audio...")
+            self.log_info("Downloading audio from YouTube...")
             downloader = AudioDownloader()
             download_success, video_title = downloader.download_from_youtube(self.youtube_url, audio_file)
             
             if not download_success:
-                self.finished_signal.emit(False, "Failed to download audio. Please check the YouTube URL.", "")
+                self.log_error("Failed to download audio")
+                self.update_progress_signal.emit(0, "Failed to download audio")
+                self.complete_signal.emit(False, "Failed to download audio")
                 return
             
-            # Update title in summary filename
-            sanitized_title = re.sub(r'[\\/*?:"<>|]', "_", video_title)  # Replace invalid filename chars
-            truncated_title = sanitized_title[:50]  # Limit length
-            summary_file = os.path.join(OUTPUT_FOLDER, f"{timestamp}_{truncated_title}.md")
+            self.log_success(f"Downloaded: {video_title}")
+            self.update_progress_signal.emit(40, "Audio download complete")
             
             # Step 2: Transcribe audio
-            self.update_progress.emit(30, "Transcribing audio...")
-            transcriber = Transcriber(self.config)
-            transcription = transcriber.transcribe_audio(audio_file, self.language_code)
+            self.log_info("Transcribing audio...")
+            self.update_progress_signal.emit(50, "Transcribing audio...")
+            
+            transcriber = Transcriber()
+            transcription = transcriber.transcribe_audio(audio_file, self.source_language)
             
             if not transcription:
-                self.finished_signal.emit(False, "No text was transcribed.", "")
+                self.log_error("No text was transcribed")
+                self.update_progress_signal.emit(0, "Transcription failed")
+                self.complete_signal.emit(False, "No text was transcribed")
                 return
             
+            word_count = len(transcription.split())
+            self.log_success(f"Transcription complete ({word_count} words)")
+            self.update_progress_signal.emit(70, "Transcription complete")
+            
             # Step 3: Summarize transcription
-            self.update_progress.emit(60, "Generating summary...")
-            summarizer = Summarizer(self.config["gemini_api_key"], self.config)
-            summary = summarizer.summarize_text(transcription, self.language_code, video_title)
+            self.log_info("Generating summary...")
+            self.update_progress_signal.emit(75, "Generating summary...")
             
-            # Save summary to file
-            with open(summary_file, "w", encoding="utf-8") as f:
-                f.write(summary)
+            summarizer = Summarizer(CONFIG["gemini_api_key"])
+            summary = summarizer.summarize_text(
+                transcription, 
+                self.source_language, 
+                self.output_language, 
+                video_title
+            )
             
-            self.update_progress.emit(90, "Cleaning up temporary files...")
+            summary_word_count = len(summary.split())
+            self.log_success(f"Summary generation complete ({summary_word_count} words)")
+            self.update_progress_signal.emit(90, "Summary generated")
             
-            # Clean up temporary directory
-            if os.path.exists(TEMP_FOLDER):
-                shutil.rmtree(TEMP_FOLDER)
+            # Save summary to markdown file
+            self.log_info("Saving summary...")
+            self.update_progress_signal.emit(95, "Saving summary...")
             
-            self.update_progress.emit(100, "Done!")
-            self.finished_signal.emit(True, f"Summary created successfully: {os.path.basename(summary_file)}", summary_file)
+            FileManager.save_to_markdown(summary, self.summary_file_path)
+            
+            # Clean up temporary files but keep summary
+            self.log_info("Cleaning up temporary files...")
+            self.update_progress_signal.emit(98, "Cleaning up...")
+            
+            FileManager.cleanup([self.summary_file_path])
+            
+            self.log_success("✓ Process completed successfully")
+            self.update_progress_signal.emit(100, "Complete!")
+            self.complete_signal.emit(True, self.summary_file_path)
             
         except Exception as e:
-            logger.error(f"Error in processing thread: {str(e)}")
-            self.finished_signal.emit(False, f"An error occurred: {str(e)}", "")
+            error_msg = str(e)
+            logger.error(f"Error in worker thread: {error_msg}")
+            self.log_error(f"Error occurred: {error_msg}")
+            self.update_progress_signal.emit(0, f"Error: {error_msg}")
+            self.complete_signal.emit(False, error_msg)
 
 
-class MainWindow(QMainWindow):
+class SummaryViewer(QMainWindow):
     def __init__(self):
         super().__init__()
+        # Check for FFmpeg
+        if not FFmpegHandler.setup():
+            QMessageBox.critical(self, "Error", "FFmpeg is required but not found. Please install FFmpeg and try again.")
+            sys.exit(1)
+            
+        self.setWindowTitle(APP_TITLE)
+        self.setGeometry(100, 100, 1200, 800)
+        self.showMaximized()  # Start maximized
+        
+        # Create the output folder if it doesn't exist
+        if not os.path.exists(OUTPUT_FOLDER):
+            os.makedirs(OUTPUT_FOLDER)
+            
         self.init_ui()
-        self.load_existing_summaries()
-        self.current_summary_file = None
+        self.load_history()
         
     def init_ui(self):
-        self.setWindowTitle("YouTube Video Summarizer")
-        self.setMinimumSize(1200, 800)
-        self.setStyleSheet(MAIN_STYLE)
-        
         # Create main widget and layout
         main_widget = QWidget()
-        main_layout = QVBoxLayout(main_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        main_layout = QVBoxLayout()
+        main_widget.setLayout(main_layout)
+        self.setCentralWidget(main_widget)
         
-        # Create header frame
-        header_frame = QFrame()
-        header_frame.setObjectName("headerFrame")
-        header_layout = QVBoxLayout(header_frame)
+        # Apply styles
+        self.setStyleSheet(STYLES)
         
-        # App title
-        title_label = QLabel("YouTube Video Summarizer")
-        title_label.setObjectName("appTitle")
-        title_label.setAlignment(Qt.AlignCenter)
-        header_layout.addWidget(title_label)
+        # Add top section for input controls
+        top_frame = QFrame()
+        top_frame.setObjectName("inputFrame")
+        top_layout = QVBoxLayout()
+        top_frame.setLayout(top_layout)
         
-        # Input container
-        input_container = QFrame()
-        input_container.setObjectName("inputContainer")
-        input_layout = QHBoxLayout(input_container)
-        
-        # YouTube URL input
-        url_layout = QVBoxLayout()
+        # URL input section
+        url_layout = QHBoxLayout()
         url_label = QLabel("YouTube URL:")
         url_label.setObjectName("inputLabel")
         self.url_input = QLineEdit()
         self.url_input.setObjectName("urlInput")
-        self.url_input.setPlaceholderText("Enter YouTube URL here")
+        self.url_input.setPlaceholderText("Enter YouTube URL here...")
+        
+        # Add a paste button for URL
+        paste_btn = QPushButton("Paste")
+        paste_btn.setObjectName("actionButton")
+        paste_btn.clicked.connect(self.paste_url)
+        
         url_layout.addWidget(url_label)
         url_layout.addWidget(self.url_input)
-        input_layout.addLayout(url_layout, 3)
+        url_layout.addWidget(paste_btn)
         
-        # Language selection
-        language_layout = QVBoxLayout()
-        language_label = QLabel("Language:")
-        language_label.setObjectName("inputLabel")
-        self.language_combo = QComboBox()
-        self.language_combo.setObjectName("languageCombo")
+        # Language selection section
+        lang_layout = QHBoxLayout()
+        
+        # Source language
+        source_lang_label = QLabel("Video Language:")
+        source_lang_label.setObjectName("inputLabel")
+        self.source_lang_combo = QComboBox()
+        self.source_lang_combo.setObjectName("comboBox")
+        
+        # Output language
+        output_lang_label = QLabel("Summary Language:")
+        output_lang_label.setObjectName("inputLabel")
+        self.output_lang_combo = QComboBox()
+        self.output_lang_combo.setObjectName("comboBox")
+        
+        # Populate language combos
         for lang in CONFIG["languages"]:
-            self.language_combo.addItem(f"{lang['name']} ({lang['code']})", lang['code'])
-        language_layout.addWidget(language_label)
-        language_layout.addWidget(self.language_combo)
-        input_layout.addLayout(language_layout, 1)
+            self.source_lang_combo.addItem(f"{lang['name']} ({lang['code']})", lang['code'])
+            self.output_lang_combo.addItem(f"{lang['name']} ({lang['code']})", lang['code'])
+        
+        # Set default to English
+        default_index = next((i for i, lang in enumerate(CONFIG["languages"]) if lang["code"] == "en-US"), 0)
+        self.source_lang_combo.setCurrentIndex(default_index)
+        self.output_lang_combo.setCurrentIndex(default_index)
+        
+        lang_layout.addWidget(source_lang_label)
+        lang_layout.addWidget(self.source_lang_combo)
+        lang_layout.addWidget(output_lang_label)
+        lang_layout.addWidget(self.output_lang_combo)
         
         # Process button
-        button_layout = QVBoxLayout()
-        button_layout.addStretch()
+        process_layout = QHBoxLayout()
         self.process_btn = QPushButton("Process Video")
-        self.process_btn.setObjectName("processButton")
+        self.process_btn.setObjectName("primaryButton")
         self.process_btn.clicked.connect(self.process_video)
-        button_layout.addWidget(self.process_btn)
-        input_layout.addLayout(button_layout, 1)
-        
-        header_layout.addWidget(input_container)
         
         # Progress bar
-        progress_container = QFrame()
-        progress_container.setObjectName("progressContainer")
-        progress_layout = QVBoxLayout(progress_container)
-        
         self.progress_bar = QProgressBar()
         self.progress_bar.setObjectName("progressBar")
-        self.progress_bar.setVisible(False)
-        progress_layout.addWidget(self.progress_bar)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p% %v")
         
-        # Status label
-        self.status_label = QLabel("Ready")
-        self.status_label.setObjectName("statusLabel")
-        self.status_label.setAlignment(Qt.AlignCenter)
-        progress_layout.addWidget(self.status_label)
+        process_layout.addWidget(self.process_btn)
+        process_layout.addWidget(self.progress_bar)
         
-        header_layout.addWidget(progress_container)
-        main_layout.addWidget(header_frame)
+        # Add layouts to top section
+        top_layout.addLayout(url_layout)
+        top_layout.addLayout(lang_layout)
+        top_layout.addLayout(process_layout)
         
-        # Main content area with splitter
-        content_frame = QFrame()
-        content_frame.setObjectName("contentFrame")
-        content_layout = QVBoxLayout(content_frame)
-        content_layout.setContentsMargins(0, 0, 0, 0)
+        # Create main splitter for content section
+        content_splitter = QSplitter(Qt.Horizontal)
         
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.setHandleWidth(1)
-        splitter.setObjectName("mainSplitter")
+        # Left section - History list
+        history_frame = QFrame()
+        history_frame.setObjectName("historyFrame")
+        history_layout = QVBoxLayout()
+        history_frame.setLayout(history_layout)
         
-        # Left panel (summary list)
-        left_panel = QFrame()
-        left_panel.setObjectName("leftPanel")
-        left_layout = QVBoxLayout(left_panel)
+        history_label = QLabel("Summary History")
+        history_label.setObjectName("sectionHeader")
+        self.history_list = QListWidget()
+        self.history_list.setObjectName("historyList")
+        self.history_list.itemClicked.connect(self.load_summary)
         
-        list_header = QFrame()
-        list_header.setObjectName("listHeader")
-        list_header_layout = QHBoxLayout(list_header)
+        history_btn_layout = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setObjectName("actionButton")
+        refresh_btn.clicked.connect(self.load_history)
+        delete_btn = QPushButton("Delete")
+        delete_btn.setObjectName("actionButton")
+        delete_btn.clicked.connect(self.delete_summary)
         
-        list_label = QLabel("Saved Summaries")
-        list_label.setObjectName("panelTitle")
-        list_header_layout.addWidget(list_label)
+        history_btn_layout.addWidget(refresh_btn)
+        history_btn_layout.addWidget(delete_btn)
         
-        left_layout.addWidget(list_header)
+        history_layout.addWidget(history_label)
+        history_layout.addWidget(self.history_list)
+        history_layout.addLayout(history_btn_layout)
         
-        # Summary list
-        self.summary_list = QListWidget()
-        self.summary_list.setObjectName("summaryList")
-        self.summary_list.itemClicked.connect(self.load_summary)
-        left_layout.addWidget(self.summary_list)
+        # Right section - Tab widget for Summary and Log
+        right_frame = QFrame()
+        right_frame.setObjectName("summaryFrame")
+        right_layout = QVBoxLayout()
+        right_frame.setLayout(right_layout)
         
-        # Buttons for managing summaries
-        list_buttons_frame = QFrame()
-        list_buttons_frame.setObjectName("buttonFrame")
-        list_buttons_layout = QHBoxLayout(list_buttons_frame)
+        # Create tab widget
+        tab_widget = QTabWidget()
+        tab_widget.setObjectName("contentTabs")
         
-        self.refresh_btn = QToolButton()
-        self.refresh_btn.setObjectName("toolButton")
-        self.refresh_btn.setText("↻")
-        self.refresh_btn.setToolTip("Refresh list")
-        self.refresh_btn.clicked.connect(self.load_existing_summaries)
-        list_buttons_layout.addWidget(self.refresh_btn)
+        # Summary Tab
+        summary_tab = QWidget()
+        summary_layout = QVBoxLayout()
+        summary_tab.setLayout(summary_layout)
         
-        self.delete_btn = QToolButton()
-        self.delete_btn.setObjectName("toolButton")
-        self.delete_btn.setText("🗑")
-        self.delete_btn.setToolTip("Delete selected summary")
-        self.delete_btn.clicked.connect(self.delete_summary)
-        list_buttons_layout.addWidget(self.delete_btn)
+        summary_header = QHBoxLayout()
+        summary_label = QLabel("Summary Preview")
+        summary_label.setObjectName("sectionHeader")
+        self.summary_title = QLabel("")
+        self.summary_title.setObjectName("summaryTitle")
         
-        list_buttons_layout.addStretch()
-        left_layout.addWidget(list_buttons_frame)
+        summary_header.addWidget(summary_label)
+        summary_header.addWidget(self.summary_title, 1)  # Add stretch to push title to right
         
-        # Right panel (summary display)
-        right_panel = QFrame()
-        right_panel.setObjectName("rightPanel")
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(0, 0, 0, 0)
+        # Summary text area with HTML support
+        self.summary_view = QTextEdit()
+        self.summary_view.setObjectName("summaryView")
+        self.summary_view.setReadOnly(True)
         
-        # Summary header
-        summary_header = QFrame()
-        summary_header.setObjectName("summaryHeader")
-        summary_header_layout = QHBoxLayout(summary_header)
+        # Summary actions
+        summary_actions = QHBoxLayout()
+        self.open_btn = QPushButton("Open in Editor")
+        self.open_btn.setObjectName("actionButton")
+        self.open_btn.clicked.connect(self.open_in_editor)
+        self.open_btn.setEnabled(False)
         
-        self.summary_title = QLabel("Summary Preview")
-        self.summary_title.setObjectName("panelTitle")
-        summary_header_layout.addWidget(self.summary_title)
+        self.copy_btn = QPushButton("Copy to Clipboard")
+        self.copy_btn.setObjectName("actionButton")
+        self.copy_btn.clicked.connect(self.copy_to_clipboard)
+        self.copy_btn.setEnabled(False)
         
-        # View mode toggle
-        view_toggle_layout = QHBoxLayout()
+        summary_actions.addWidget(self.open_btn)
+        summary_actions.addWidget(self.copy_btn)
+        summary_actions.addStretch()
         
-        self.view_formatted_btn = QToolButton()
-        self.view_formatted_btn.setObjectName("viewToggleButton")
-        self.view_formatted_btn.setText("Preview")
-        self.view_formatted_btn.setToolTip("View formatted summary")
-        self.view_formatted_btn.setCheckable(True)
-        self.view_formatted_btn.setChecked(True)
-        self.view_formatted_btn.clicked.connect(lambda: self.toggle_view_mode(True))
-        view_toggle_layout.addWidget(self.view_formatted_btn)
+        summary_layout.addLayout(summary_header)
+        summary_layout.addWidget(self.summary_view)
+        summary_layout.addLayout(summary_actions)
         
-        self.view_source_btn = QToolButton()
-        self.view_source_btn.setObjectName("viewToggleButton")
-        self.view_source_btn.setText("Source")
-        self.view_source_btn.setToolTip("View source markdown")
-        self.view_source_btn.setCheckable(True)
-        self.view_source_btn.clicked.connect(lambda: self.toggle_view_mode(False))
-        view_toggle_layout.addWidget(self.view_source_btn)
+        # Log Tab
+        log_tab = QWidget()
+        log_layout = QVBoxLayout()
+        log_tab.setLayout(log_layout)
         
-        summary_header_layout.addLayout(view_toggle_layout)
+        log_header = QHBoxLayout()
+        log_label = QLabel("Processing Status")
+        log_label.setObjectName("sectionHeader")
         
-        # Export button
-        self.export_btn = QToolButton()
-        self.export_btn.setObjectName("toolButton")
-        self.export_btn.setText("⤓")
-        self.export_btn.setToolTip("Export summary")
-        self.export_btn.clicked.connect(self.export_summary)
-        summary_header_layout.addWidget(self.export_btn)
+        log_header.addWidget(log_label)
+        log_header.addStretch()
         
-        right_layout.addWidget(summary_header)
+        # Activity log area
+        self.activity_log = QTextEdit()
+        self.activity_log.setObjectName("activityLog")
+        self.activity_log.setReadOnly(True)
         
-        # Summary display area
-        summary_container = QFrame()
-        summary_container.setObjectName("summaryContainer")
-        summary_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        summary_layout = QVBoxLayout(summary_container)
+        # Log actions
+        log_actions = QHBoxLayout()
+        clear_log_btn = QPushButton("Clear Log")
+        clear_log_btn.setObjectName("actionButton")
+        clear_log_btn.clicked.connect(self.clear_log)
         
-        self.summary_display = QTextBrowser()
-        self.summary_display.setObjectName("summaryDisplay")
-        self.summary_display.setOpenExternalLinks(True)
-        self.summary_display.setWordWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        copy_log_btn = QPushButton("Copy Log")
+        copy_log_btn.setObjectName("actionButton")
+        copy_log_btn.clicked.connect(self.copy_log)
         
-        summary_layout.addWidget(self.summary_display)
-        right_layout.addWidget(summary_container)
+        log_actions.addWidget(clear_log_btn)
+        log_actions.addWidget(copy_log_btn)
+        log_actions.addStretch()
         
-        # Add panels to splitter
-        splitter.addWidget(left_panel)
-        splitter.addWidget(right_panel)
-        splitter.setSizes([250, 950])  # Default sizes (20% left, 80% right)
+        log_layout.addLayout(log_header)
+        log_layout.addWidget(self.activity_log)
+        log_layout.addLayout(log_actions)
         
-        content_layout.addWidget(splitter)
-        main_layout.addWidget(content_frame)
+        # Add tabs to tab widget
+        tab_widget.addTab(summary_tab, "Summary")
+        tab_widget.addTab(log_tab, "Activity Log")
         
-        self.setCentralWidget(main_widget)
+        right_layout.addWidget(tab_widget)
         
-        # Create a button group for the view buttons
-        self.view_formatted_btn.clicked.connect(lambda: self.view_source_btn.setChecked(False))
-        self.view_source_btn.clicked.connect(lambda: self.view_formatted_btn.setChecked(False))
+        # Set up the splitter
+        content_splitter.addWidget(history_frame)
+        content_splitter.addWidget(right_frame)
+        content_splitter.setStretchFactor(0, 1)  # History gets 1/5 of space
+        content_splitter.setStretchFactor(1, 4)  # Content gets 4/5 of space
+        
+        # Add the top section and content splitter to main layout
+        main_layout.addWidget(top_frame)
+        main_layout.addWidget(content_splitter, 1)  # Give the splitter the most space
+        
+        # Add status bar
+        self.status_bar = QStatusBar()
+        self.status_bar.setObjectName("statusBar")
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Ready")
+        
+        # Initialize current summary path
+        self.current_summary_path = None
+        
+        # Add welcome message to activity log
+        self.add_to_log("Welcome to YouTube Video Summarizer", "info")
+        self.add_to_log("Enter a YouTube URL and select languages to begin", "info")
+
+    def add_to_log(self, message, level="info"):
+        """Add a user-friendly message to the log with appropriate formatting"""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        
+        # Set color based on message level
+        if level == "info":
+            color = "#444444"  # Dark gray
+            prefix = "ℹ️ "
+        elif level == "success":
+            color = "#28a745"  # Green
+            prefix = "✓ "
+        elif level == "warning":
+            color = "#ffc107"  # Yellow/amber
+            prefix = "⚠️ "
+        elif level == "error":
+            color = "#dc3545"  # Red
+            prefix = "❌ "
+        else:
+            color = "#444444"
+            prefix = ""
+        
+        # Format and add the message
+        formatted_message = f"<span style='color:#888888'>[{timestamp}]</span> <span style='color:{color}'>{prefix}{message}</span>"
+        self.activity_log.append(formatted_message)
+        
+        # Make sure newest log entries are visible
+        self.activity_log.verticalScrollBar().setValue(self.activity_log.verticalScrollBar().maximum())
+        
+        # Also log to system logger if it's an error or warning
+        if level == "error":
+            logger.error(message)
+        elif level == "warning":
+            logger.warning(message)
+
+    def clear_log(self):
+        """Clear the activity log"""
+        self.activity_log.clear()
+        self.add_to_log("Log cleared", "info")
+        
+    def copy_log(self):
+        """Copy log content to clipboard"""
+        if self.activity_log.toPlainText():
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.activity_log.toPlainText())
+            self.status_bar.showMessage("Log copied to clipboard")
+            self.add_to_log("Log copied to clipboard", "info")
+        else:
+            self.status_bar.showMessage("No log content to copy")
+
+    def paste_url(self):
+        """Paste clipboard content to URL input"""
+        clipboard = QApplication.clipboard()
+        self.url_input.setText(clipboard.text())
+        self.add_to_log("URL pasted from clipboard", "info")
     
-    def load_existing_summaries(self):
-        """Load existing summary files from the output folder."""
-        self.summary_list.clear()
+    def load_history(self):
+        """Load summary history from output folder"""
+        self.history_list.clear()
         
-        # Create output folder if it doesn't exist
-        if not os.path.exists(OUTPUT_FOLDER):
-            os.makedirs(OUTPUT_FOLDER)
-            self.status_label.setText(f"Created output folder: {OUTPUT_FOLDER}")
-            return
+        # Find all markdown files in the output folder
+        summary_files = glob.glob(os.path.join(OUTPUT_FOLDER, "*_summary.md"))
         
-        # Look for .md files in the output folder
-        summary_files = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith('.md')]
+        # Sort by modification time, newest first
+        summary_files.sort(key=os.path.getmtime, reverse=True)
         
-        if not summary_files:
-            self.status_label.setText("No existing summaries found.")
-            return
+        for file_path in summary_files:
+            # Get filename only
+            filename = os.path.basename(file_path)
+            
+            # Try to extract date from filename
+            try:
+                date_part = filename.split('_')[0]
+                date_obj = datetime.datetime.strptime(date_part, "%Y%m%d%H%M%S")
+                display_name = date_obj.strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                display_name = filename
+                
+            # Add to list with full path as data
+            self.history_list.addItem(display_name)
+            # Store the full path in the item's data
+            self.history_list.item(self.history_list.count() - 1).setData(Qt.UserRole, file_path)
         
-        # Sort files by creation time (newest first)
-        summary_files.sort(key=lambda x: os.path.getctime(os.path.join(OUTPUT_FOLDER, x)), reverse=True)
-        
-        # Add files to the list
-        for file in summary_files:
-            self.summary_list.addItem(file)
-        
-        self.status_label.setText(f"Found {len(summary_files)} existing summaries.")
+        self.add_to_log(f"Loaded {len(summary_files)} summaries from history", "info")
     
     def load_summary(self, item):
-        """Load and display a selected summary."""
-        filename = item.text()
-        file_path = os.path.join(OUTPUT_FOLDER, filename)
+        """Load and display selected summary"""
+        file_path = item.data(Qt.UserRole)
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "File Not Found", f"The file {file_path} could not be found.")
+            self.load_history()  # Refresh the list
+            return
         
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
+                md_content = f.read()
+                
+            # Convert Markdown to HTML
+            html_content = markdown.markdown(md_content, extensions=['tables', 'fenced_code'])
             
-            self.current_summary_file = file_path
-            self.summary_title.setText(f"Summary: {filename}")
+            # Set as current summary
+            self.current_summary_path = file_path
+            self.summary_title.setText(os.path.basename(file_path))
             
-            # Store original content
-            self.current_markdown_content = content
+            # Display in the viewer with HTML formatting
+            self.summary_view.setHtml(html_content)
             
-            # Default to formatted view
-            self.view_formatted_btn.setChecked(True)
-            self.view_source_btn.setChecked(False)
-            self.render_markdown(content)
+            # Enable action buttons
+            self.open_btn.setEnabled(True)
+            self.copy_btn.setEnabled(True)
             
-            self.status_label.setText(f"Loaded summary: {filename}")
+            self.status_bar.showMessage(f"Loaded: {file_path}")
+            self.add_to_log(f"Loaded summary: {os.path.basename(file_path)}", "info")
         except Exception as e:
-            self.status_label.setText(f"Error loading summary: {str(e)}")
-    
-    def toggle_view_mode(self, formatted):
-        """Toggle between formatted and source view modes."""
-        if not self.current_summary_file:
-            return
-            
-        if formatted:
-            self.render_markdown(self.current_markdown_content)
-        else:
-            self.summary_display.setPlainText(self.current_markdown_content)
-    
-    def render_markdown(self, content):
-        """Render markdown content to HTML for display."""
-        if HAS_MARKDOWN:
-            try:
-                # Convert Markdown to HTML with additional extensions
-                html_content = markdown.markdown(
-                    content, 
-                    extensions=[
-                        'markdown.extensions.extra',
-                        'markdown.extensions.nl2br',
-                        'markdown.extensions.sane_lists'
-                    ]
-                )
-                
-                # Add CSS for better rendering
-                html_content = f"""
-                <html>
-                <head>
-                <style>
-                {HTML_STYLE}
-                </style>
-                </head>
-                <body>
-                {html_content}
-                </body>
-                </html>
-                """
-                
-                self.summary_display.setHtml(html_content)
-            except Exception as e:
-                self.summary_display.setPlainText(f"Error rendering markdown: {str(e)}\n\n{content}")
-        else:
-            # Fallback to plain text if markdown module is not available
-            self.summary_display.setPlainText(content)
-    
-    def process_video(self):
-        """Process a YouTube video based on the provided URL and language."""
-        url = self.url_input.text().strip()
-        
-        if not url:
-            QMessageBox.warning(self, "Input Error", "Please enter a YouTube URL.")
-            return
-        
-        # Get selected language code
-        language_code = self.language_combo.currentData()
-        
-        # Disable UI elements during processing
-        self.process_btn.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-        self.status_label.setText("Starting process...")
-        
-        # Create and start the processing thread
-        self.processing_thread = ProcessingThread(url, language_code)
-        self.processing_thread.update_progress.connect(self.update_progress)
-        self.processing_thread.finished_signal.connect(self.process_finished)
-        self.processing_thread.start()
-    
-    def update_progress(self, value, message):
-        """Update progress bar and status message."""
-        self.progress_bar.setValue(value)
-        self.status_label.setText(message)
-    
-    def process_finished(self, success, message, filename):
-        """Handle completion of video processing."""
-        self.process_btn.setEnabled(True)
-        
-        if success:
-            self.status_label.setText(message)
-            self.load_existing_summaries()
-            
-            # Select and load the new summary
-            for i in range(self.summary_list.count()):
-                if self.summary_list.item(i).text() == os.path.basename(filename):
-                    self.summary_list.setCurrentRow(i)
-                    self.load_summary(self.summary_list.item(i))
-                    break
-        else:
-            self.progress_bar.setVisible(False)
-            QMessageBox.warning(self, "Processing Error", message)
-            self.status_label.setText("Ready")
+            error_msg = str(e)
+            self.status_bar.showMessage(f"Error loading summary: {error_msg}")
+            self.add_to_log(f"Error loading summary: {error_msg}", "error")
     
     def delete_summary(self):
-        """Delete the currently selected summary."""
-        current_item = self.summary_list.currentItem()
+        """Delete the selected summary file"""
+        current_item = self.history_list.currentItem()
         if not current_item:
-            QMessageBox.information(self, "Selection Required", "Please select a summary to delete.")
+            QMessageBox.information(self, "No Selection", "Please select a summary to delete.")
             return
         
-        filename = current_item.text()
-        reply = QMessageBox.question(
-            self, 'Confirm Deletion',
-            f"Are you sure you want to delete '{filename}'?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
-        )
+        file_path = current_item.data(Qt.UserRole)
+        
+        # Confirm deletion
+        reply = QMessageBox.question(self, 'Confirm Deletion',
+                                    f"Are you sure you want to delete this summary?\n{os.path.basename(file_path)}",
+                                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         
         if reply == QMessageBox.Yes:
             try:
-                file_path = os.path.join(OUTPUT_FOLDER, filename)
                 os.remove(file_path)
-                self.load_existing_summaries()
-                self.summary_display.clear()
-                self.summary_title.setText("Summary Preview")
-                self.current_summary_file = None
-                self.status_label.setText(f"Deleted: {filename}")
+                self.status_bar.showMessage(f"Deleted: {file_path}")
+                self.add_to_log(f"Deleted summary: {os.path.basename(file_path)}", "info")
+                
+                # Clear view if this was the current summary
+                if self.current_summary_path == file_path:
+                    self.summary_view.clear()
+                    self.summary_title.setText("")
+                    self.current_summary_path = None
+                    self.open_btn.setEnabled(False)
+                    self.copy_btn.setEnabled(False)
+                
+                # Refresh the list
+                self.load_history()
             except Exception as e:
-                QMessageBox.warning(self, "Deletion Error", f"Failed to delete file: {str(e)}")
+                error_msg = str(e)
+                self.status_bar.showMessage(f"Error deleting file: {error_msg}")
+                self.add_to_log(f"Error deleting file: {error_msg}", "error")
     
-    def export_summary(self):
-        """Export the current summary to another location."""
-        if not self.current_summary_file or not os.path.exists(self.current_summary_file):
-            QMessageBox.information(self, "No Summary", "Please select a summary to export.")
+    def open_in_editor(self):
+        """Open the current summary in default application"""
+        if self.current_summary_path and os.path.exists(self.current_summary_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.current_summary_path))
+            self.add_to_log("Opened summary in external editor", "info")
+        else:
+            QMessageBox.warning(self, "Error", "No valid summary file is currently selected.")
+    
+    def copy_to_clipboard(self):
+        """Copy summary content to clipboard"""
+        if self.summary_view.toPlainText():
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self.summary_view.toPlainText())
+            self.status_bar.showMessage("Summary copied to clipboard")
+            self.add_to_log("Summary copied to clipboard", "info")
+        else:
+            self.status_bar.showMessage("No content to copy")
+    
+    def process_video(self):
+        """Process the YouTube video and generate a summary"""
+        # Get inputs
+        youtube_url = self.url_input.text().strip()
+        if not youtube_url:
+            QMessageBox.warning(self, "Input Error", "Please enter a YouTube URL.")
             return
         
-        # Open file dialog to select destination
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Export Summary", 
-            os.path.basename(self.current_summary_file),
-            "Markdown Files (*.md);;Text Files (*.txt);;HTML Files (*.html);;All Files (*)"
-        )
+        # Get selected language codes
+        source_language = self.source_lang_combo.currentData()
+        source_language_name = self.source_lang_combo.currentText()
         
-        if filename:
-            try:
-                # If exporting as HTML and we have markdown module
-                if filename.lower().endswith('.html') and HAS_MARKDOWN:
-                    with open(self.current_summary_file, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    html_content = markdown.markdown(
-                        content, 
-                        extensions=[
-                            'markdown.extensions.extra',
-                            'markdown.extensions.nl2br',
-                            'markdown.extensions.sane_lists'
-                        ]
-                    )
-                    
-                    # Add some styling
-                    styled_html = f"""<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{os.path.basename(self.current_summary_file)}</title>
-    <style>
-    {SUMMARY_CSS}
-    </style>
-</head>
-<body>
-    <div class="main-content">
-        {html_content}
-    </div>
-</body>
-</html>"""
-                    
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(styled_html)
-                else:
-                    # Normal file copy for other formats
-                    shutil.copy2(self.current_summary_file, filename)
-                
-                self.status_label.setText(f"Exported summary to: {filename}")
-            except Exception as e:
-                QMessageBox.warning(self, "Export Error", f"Failed to export file: {str(e)}")
+        output_language = self.output_lang_combo.currentData()
+        output_language_name = self.output_lang_combo.currentText()
+        
+        # Log the process start
+        self.add_to_log("Starting new video processing task", "info")
+        self.add_to_log(f"URL: {youtube_url}", "info")
+        self.add_to_log(f"Video Language: {source_language_name}", "info")
+        self.add_to_log(f"Summary Language: {output_language_name}", "info")
+        
+        # Disable the process button and show progress
+        self.process_btn.setEnabled(False)
+        self.progress_bar.setValue(0)
+        self.status_bar.showMessage("Processing video...")
+        
+        # Create and start worker thread
+        self.worker = WorkerThread(youtube_url, source_language, output_language)
+        self.worker.update_progress_signal.connect(self.update_progress)
+        self.worker.complete_signal.connect(self.process_complete)
+        self.worker.log_signal.connect(self.handle_worker_log)
+        self.worker.start()
+    
+    def handle_worker_log(self, message, level):
+        """Handle log messages from worker thread"""
+        self.add_to_log(message, level)
+    
+    def update_progress(self, value, message):
+        """Update progress bar and status"""
+        self.progress_bar.setValue(value)
+        self.status_bar.showMessage(message)
+    
+    def process_complete(self, success, result):
+        """Handle process completion"""
+        # Re-enable the process button
+        self.process_btn.setEnabled(True)
+        
+        if success:
+            # Refresh the history list
+            self.load_history()
+            
+            # Find and select the new summary
+            for i in range(self.history_list.count()):
+                item = self.history_list.item(i)
+                if item.data(Qt.UserRole) == result:
+                    self.history_list.setCurrentItem(item)
+                    self.load_summary(item)
+                    break
+            
+            self.status_bar.showMessage("Processing complete!")
+            self.add_to_log("Video processing completed successfully", "success")
+            QMessageBox.information(self, "Success", "Video processing complete!")
+        else:
+            self.status_bar.showMessage(f"Error: {result}")
+            self.add_to_log(f"Processing failed: {result}", "error")
+            QMessageBox.critical(self, "Error", f"An error occurred:\n{result}")
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")  # Use Fusion style for a modern look
-    
-    # Check if markdown module is available, if not, suggest installation
-    if not HAS_MARKDOWN:
-        print("To enable markdown rendering, install the markdown module:")
-        print("pip install markdown")
-    
-    # Create and show the main window
-    window = MainWindow()
+    window = SummaryViewer()
     window.show()
-    
     sys.exit(app.exec_())

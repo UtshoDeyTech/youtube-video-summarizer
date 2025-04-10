@@ -11,6 +11,10 @@ import concurrent.futures
 import logging
 import shutil
 import glob
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Set up logging
 logging.basicConfig(
@@ -27,14 +31,22 @@ CONFIG = {
     "silence_threshold": 16,
     "use_parallel": True,
     "max_workers": 4,
-    "gemini_api_key": "AIzaSyCvr7e0_1Rg-xKXbXZT4eRN3gDYEY3bVZQ",
+    "gemini_api_key": os.getenv("GEMINI_API_KEY"),
     "languages": [
         {"code": "bn-BD", "name": "Bangla"},
         {"code": "en-US", "name": "English"},
-        {"code": "hi-IN", "name": "Hindi"}
+        {"code": "hi-IN", "name": "Hindi"},
+        {"code": "es-ES", "name": "Spanish"},
+        {"code": "fr-FR", "name": "French"},
+        {"code": "de-DE", "name": "German"},
+        {"code": "ja-JP", "name": "Japanese"},
+        {"code": "ko-KR", "name": "Korean"},
+        {"code": "zh-CN", "name": "Chinese (Simplified)"},
+        {"code": "ar-SA", "name": "Arabic"}
     ],
     "temp_directory": "temp_files"
 }
+
 
 class FFmpegHandler:
     @staticmethod
@@ -47,8 +59,8 @@ class FFmpegHandler:
                                     text=True)
             if result.returncode == 0 and result.stdout.strip():
                 return result.stdout.strip()
-        except Exception:  # Specify the exception instead of using bare except
-            pass
+        except Exception as e:
+            logger.error(f"Error finding FFmpeg: {e}")
         
         # Common locations
         common_locations = [
@@ -72,8 +84,9 @@ class FFmpegHandler:
             AudioSegment.converter = ffmpeg_path
             return True
         else:
-            logger.warning("Could not find FFmpeg automatically. Audio processing may fail.")
+            logger.error("Could not find FFmpeg. Audio processing will fail.")
             return False
+
 
 class AudioDownloader:
     @staticmethod
@@ -100,6 +113,7 @@ class AudioDownloader:
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             return False, "Unknown Title"
+
 
 class Transcriber:
     def __init__(self, config=CONFIG):
@@ -200,6 +214,7 @@ class Transcriber:
         
         return full_transcription
 
+
 class Summarizer:
     def __init__(self, api_key, config=CONFIG):
         self.api_key = api_key
@@ -265,15 +280,13 @@ class Summarizer:
         
         return chunks
     
-    def get_prompts(self, language_code, video_title):
+    def get_prompts(self, source_language_code, output_language_code, video_title):
         """Get enhanced universal prompts with language-specific output instructions."""
-        # Define language display name for prompt instructions
-        language_display_name = next(
-            (lang["name"] for lang in self.config["languages"] if lang["code"] == language_code), 
-            "the detected language"
-        )
+        # Define language display names for prompt instructions
+        source_language_display_name = self._get_language_name(source_language_code)
+        output_language_display_name = self._get_language_name(output_language_code)
         
-        first_chunk_prompt = f"""Analyze and summarize the following transcript text thoroughly. Your output must be in {language_display_name} language.
+        first_chunk_prompt = f"""Analyze and summarize the following transcript text thoroughly. The transcript is in {source_language_display_name} language, but your output must be in {output_language_display_name} language.
 
 First, try to identify:
 1. The core topic or theme of the content
@@ -294,7 +307,7 @@ Then create a summary following this format:
 
 Remember this is the first part of a larger transcript, so identify recurring themes that may continue throughout the content."""
 
-        middle_chunk_prompt = f"""Continue analyzing this middle section of the transcript. Your output must be in {language_display_name} language.
+        middle_chunk_prompt = f"""Continue analyzing this middle section of the transcript. The transcript is in {source_language_display_name} language, but your output must be in {output_language_display_name} language.
 
 First, check if this section:
 1. Introduces new topics or themes
@@ -315,7 +328,7 @@ Then create a summary following this format:
 
 Be attentive to the speaker's emphasis, repetition, or emotional cues that indicate important points."""
 
-        last_chunk_prompt = f"""This is the final part of the transcript. Analyze it carefully while reflecting on the entire content. Your output must be in {language_display_name} language.
+        last_chunk_prompt = f"""This is the final part of the transcript. Analyze it carefully while reflecting on the entire content. The transcript is in {source_language_display_name} language, but your output must be in {output_language_display_name} language.
 
 First, identify:
 1. How the speaker concludes their message
@@ -340,7 +353,7 @@ Then create a comprehensive summary following this format:
 
 This final section should help tie together all the content into a coherent whole."""
 
-        consolidation_prompt = f"""Create a comprehensive, in-depth markdown summary of this YouTube video transcript. Your output must be entirely in {language_display_name} language.
+        consolidation_prompt = f"""Create a comprehensive, in-depth markdown summary of this YouTube video transcript. The transcript is in {source_language_display_name} language, but your output must be entirely in {output_language_display_name} language.
 
 Video Title: "{video_title}"
 
@@ -397,14 +410,21 @@ Remember to maintain the original tone and perspective of the speaker while ensu
             "consolidation": consolidation_prompt
         }
     
-    def summarize_text(self, input_text, language_code, video_title, chunk_size=4000):
+    def _get_language_name(self, language_code):
+        """Get the display name for a language code."""
+        return next(
+            (lang["name"] for lang in self.config["languages"] if lang["code"] == language_code), 
+            "the detected language"
+        )
+    
+    def summarize_text(self, input_text, source_language_code, output_language_code, video_title, chunk_size=4000):
         """Summarize text using Gemini API with enhanced analytical approach."""
         # Split the text into manageable chunks
         text_chunks = self.split_text_into_chunks(input_text, chunk_size)
         logger.info(f"Text split into {len(text_chunks)} chunks for processing")
         
         # Get enhanced prompts
-        prompts = self.get_prompts(language_code, video_title)
+        prompts = self.get_prompts(source_language_code, output_language_code, video_title)
         
         # Process each chunk with enhanced analysis
         chunk_summaries = []
@@ -454,17 +474,10 @@ Remember to maintain the original tone and perspective of the speaker while ensu
                 # Return all chunk summaries if consolidation fails
                 return "\n\n".join(chunk_summaries)
         else:
-            # Format single chunk as markdown with a universal format
             # For a single chunk, we'll still want to get a comprehensive summary
             try:
-                # Get language display name for the prompt
-                language_display_name = next(
-                    (lang["name"] for lang in self.config["languages"] if lang["code"] == language_code), 
-                    "the detected language"
-                )
-                
                 # Create a simplified consolidation prompt for single chunks
-                single_chunk_prompt = f"""Create a comprehensive markdown summary of this YouTube video transcript. Your output must be entirely in {language_display_name} language.
+                single_chunk_prompt = f"""Create a comprehensive markdown summary of this YouTube video transcript. The transcript is in {self._get_language_name(source_language_code)} language, but your output must be entirely in {self._get_language_name(output_language_code)} language.
 
 Video Title: "{video_title}"
 
@@ -503,6 +516,7 @@ Use proper markdown formatting throughout with correct heading levels, bullet po
 {chunk_summaries[0]}
 """
                 return formatted_text
+
 
 class FileManager:
     @staticmethod
@@ -560,13 +574,14 @@ class FileManager:
             logger.error(f"Error saving content to {filepath}: {e}")
             return False
 
+
 class YouTubeProcessor:
     def __init__(self, config=CONFIG):
         self.config = config
         self.transcriber = Transcriber(config)
         self.summarizer = Summarizer(config["gemini_api_key"], config)
         
-    def process_video(self, youtube_url, language_code):
+    def process_video(self, youtube_url, source_language_code, output_language_code):
         """Process a YouTube video: download, transcribe, and summarize."""
         # Generate timestamp for filenames
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -576,12 +591,15 @@ class YouTubeProcessor:
         transcription_file = f"{timestamp}_transcription.md"
         summary_file = f"{timestamp}_summary.md"
         
-        # Get language name
-        language_name = next((lang["name"] for lang in self.config["languages"] 
-                             if lang["code"] == language_code), language_code)
+        # Get language names
+        source_language_name = next((lang["name"] for lang in self.config["languages"] 
+                                 if lang["code"] == source_language_code), source_language_code)
+        output_language_name = next((lang["name"] for lang in self.config["languages"] 
+                                 if lang["code"] == output_language_code), output_language_code)
         
         logger.info(f"Starting to process YouTube video: {youtube_url}")
-        logger.info(f"Selected language: {language_name} ({language_code})")
+        logger.info(f"Source language: {source_language_name} ({source_language_code})")
+        logger.info(f"Output language: {output_language_name} ({output_language_code})")
         
         # Create temp directory if it doesn't exist
         os.makedirs(self.config["temp_directory"], exist_ok=True)
@@ -596,7 +614,7 @@ class YouTubeProcessor:
         
         # Step 2: Transcribe audio
         logger.info("Starting transcription process...")
-        transcription = self.transcriber.transcribe_audio(audio_file, language_code)
+        transcription = self.transcriber.transcribe_audio(audio_file, source_language_code)
         
         if not transcription:
             logger.error("No text was transcribed.")
@@ -608,7 +626,12 @@ class YouTubeProcessor:
         # Step 3: Summarize transcription
         logger.info("Starting summarization process...")
         try:
-            summary = self.summarizer.summarize_text(transcription, language_code, video_title)
+            summary = self.summarizer.summarize_text(
+                transcription, 
+                source_language_code, 
+                output_language_code, 
+                video_title
+            )
             
             # Save summary to markdown file
             FileManager.save_to_markdown(summary, summary_file)
@@ -626,15 +649,16 @@ class YouTubeProcessor:
             logger.error(f"An error occurred during summarization: {e}")
             return False
 
-def display_language_menu(languages):
+
+def display_language_menu(languages, prompt):
     """Display a menu of available languages and get user selection."""
-    print("\n----- AVAILABLE LANGUAGES -----")
+    print(f"\n----- {prompt} -----")
     for i, lang in enumerate(languages, 1):
         print(f"{i}. {lang['name']} ({lang['code']})")
     
     while True:
         try:
-            choice = int(input("\nSelect language [1-{}]: ".format(len(languages))))
+            choice = int(input(f"\nSelect language [1-{len(languages)}]: "))
             if 1 <= choice <= len(languages):
                 return languages[choice-1]["code"]
             else:
@@ -642,7 +666,12 @@ def display_language_menu(languages):
         except ValueError:
             print("Please enter a valid number")
 
+
 def main():
+    print("=" * 50)
+    print("YouTube Video Transcriber and Summarizer")
+    print("=" * 50)
+    
     # Setup
     if not FFmpegHandler.setup():
         logger.error("FFmpeg is required for audio processing. Please install it and try again.")
@@ -651,12 +680,31 @@ def main():
     # Get YouTube URL
     youtube_url = input("Enter YouTube URL: ").strip()
     
-    # Display language menu and get selection
-    selected_language = display_language_menu(CONFIG["languages"])
+    # Display language menus and get selections
+    source_language_code = display_language_menu(
+        CONFIG["languages"], 
+        "SELECT SOURCE LANGUAGE (Language of the YouTube video)"
+    )
+    
+    output_language_code = display_language_menu(
+        CONFIG["languages"], 
+        "SELECT OUTPUT LANGUAGE (Language for the summary)"
+    )
+    
+    print("\nProcessing video...")
+    print(f"Source language: {next((lang['name'] for lang in CONFIG['languages'] if lang['code'] == source_language_code), source_language_code)}")
+    print(f"Output language: {next((lang['name'] for lang in CONFIG['languages'] if lang['code'] == output_language_code), output_language_code)}")
+    print("=" * 50)
     
     # Process the video
     processor = YouTubeProcessor()
-    processor.process_video(youtube_url, selected_language)
+    success = processor.process_video(youtube_url, source_language_code, output_language_code)
+    
+    if success:
+        print("\nProcess completed successfully! Check the generated markdown files.")
+    else:
+        print("\nAn error occurred during processing. Check the logs for details.")
+
 
 if __name__ == "__main__":
     main()
